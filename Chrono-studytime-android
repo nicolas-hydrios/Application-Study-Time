@@ -1,0 +1,527 @@
+package com.example.chronotimeweek;
+
+import android.content.Context;
+import android.content.SharedPreferences;
+import android.os.Bundle;
+import android.util.Log;
+import android.view.LayoutInflater;
+import android.view.View;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.TextView;
+import android.widget.Toast;
+
+import androidx.appcompat.app.AlertDialog;
+import androidx.appcompat.app.AppCompatActivity;
+
+import com.google.firebase.Timestamp;
+import com.google.firebase.auth.FirebaseAuth;
+import com.google.firebase.auth.FirebaseUser;
+import com.google.firebase.firestore.DocumentSnapshot;
+import com.google.firebase.firestore.FirebaseFirestore;
+import com.google.firebase.firestore.QueryDocumentSnapshot;
+import com.prolificinteractive.materialcalendarview.CalendarDay;
+import com.prolificinteractive.materialcalendarview.MaterialCalendarView;
+
+import java.text.ParseException;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.Date;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.List;
+import java.util.Locale;
+import java.util.Map;
+import java.util.Set;
+import java.util.TimeZone;
+
+public class CalendarActivity extends AppCompatActivity {
+
+    private static final String PREFS_NAME     = "chrono_prefs";
+    private static final String GROUP_ID_KEY   = "GROUP_ID_KEY";
+
+    private FirebaseFirestore db;
+    private FirebaseAuth      auth;
+    private FirebaseUser      user;
+    private SharedPreferences prefs;
+
+    private String currentGroupId;
+
+    private Button btnAuth, btnCreateGroup, btnViewGroup, btnJoinGroup;
+    private TextView groupIdTextView;
+    private MaterialCalendarView calendarView;
+
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_calendar);
+
+        // Récupère les vues
+        btnAuth         = findViewById(R.id.btnAuth);
+        btnCreateGroup  = findViewById(R.id.btnCreateGroup);
+        btnViewGroup    = findViewById(R.id.btnViewGroup);
+        btnJoinGroup    = findViewById(R.id.btnJoinGroup);
+        groupIdTextView = findViewById(R.id.groupIdTextView);
+        calendarView    = findViewById(R.id.calendarView);
+
+        // Firebase
+        db   = FirebaseFirestore.getInstance();
+        auth = FirebaseAuth.getInstance();
+        user = auth.getCurrentUser();
+
+        // SharedPrefs
+        prefs          = getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE);
+        currentGroupId = prefs.getString(GROUP_ID_KEY, null);
+
+        updateAuthButtonText();
+        updateGroupIdText();
+        updateCreateGroupButtonText();
+
+        // Listener de clic date
+        calendarView.setOnDateChangedListener((widget, date, selected) ->
+                showEventsForDay(date)
+        );
+
+        // Charge initial des pastilles
+        if (currentGroupId != null && !currentGroupId.isEmpty()) {
+            updateCalendarDots();
+        } else {
+            calendarView.removeDecorators();
+        }
+
+        setupListeners();
+    }
+
+    // ----------------------------
+    //  UI Updates
+    // ----------------------------
+    private void updateAuthButtonText() {
+        btnAuth.setText(user != null ? "Déconnexion" : "Connexion");
+    }
+    private void updateGroupIdText() {
+        groupIdTextView.setText(
+                currentGroupId != null
+                        ? "Groupe ID : " + currentGroupId
+                        : "Groupe ID : (aucun)"
+        );
+    }
+    private void updateCreateGroupButtonText() {
+        btnCreateGroup.setText(
+                currentGroupId != null && !currentGroupId.isEmpty()
+                        ? "Quitter le groupe"
+                        : "Créer un groupe"
+        );
+    }
+
+    // ----------------------------
+    //  Boutons
+    // ----------------------------
+    private void setupListeners() {
+        // Auth / déconnexion
+        btnAuth.setOnClickListener(v -> {
+            if (user != null) {
+                new AlertDialog.Builder(this)
+                        .setTitle("Déconnexion")
+                        .setMessage("Voulez-vous vous déconnecter ?")
+                        .setPositiveButton("Oui", (d,w) -> {
+                            auth.signOut();
+                            user = null;
+                            updateAuthButtonText();
+                            Toast.makeText(this, "Déconnecté", Toast.LENGTH_SHORT).show();
+                        })
+                        .setNegativeButton("Annuler", null)
+                        .show();
+            } else {
+                showLoginDialog();
+            }
+        });
+
+        // Créer / quitter groupe
+        btnCreateGroup.setOnClickListener(v -> {
+            if (currentGroupId != null && !currentGroupId.isEmpty()) {
+                new AlertDialog.Builder(this)
+                        .setTitle("Quitter le groupe")
+                        .setMessage("Êtes-vous sûr ?")
+                        .setPositiveButton("Oui", (d,w) -> {
+                            prefs.edit().remove(GROUP_ID_KEY).apply();
+                            currentGroupId = null;
+                            updateGroupIdText();
+                            updateCreateGroupButtonText();
+                            calendarView.removeDecorators();
+                            Toast.makeText(this, "Groupe quitté", Toast.LENGTH_SHORT).show();
+                        })
+                        .setNegativeButton("Annuler", null)
+                        .show();
+            } else {
+                // création
+                String newId = db.collection("groups").document().getId();
+                List<String> members = new ArrayList<>();
+                if (user != null && user.getEmail() != null) {
+                    members.add(user.getEmail());
+                }
+                Map<String,Object> data = new HashMap<>();
+                data.put("members", members);
+                db.collection("groups").document(newId)
+                        .set(data)
+                        .addOnSuccessListener(a -> {
+                            currentGroupId = newId;
+                            prefs.edit().putString(GROUP_ID_KEY, newId).apply();
+                            updateGroupIdText();
+                            updateCreateGroupButtonText();
+                            updateCalendarDots();
+                            Toast.makeText(this, "Groupe créé !", Toast.LENGTH_SHORT).show();
+                        });
+            }
+        });
+
+        // Voir membres
+        btnViewGroup.setOnClickListener(v -> {
+            if (currentGroupId == null) {
+                Toast.makeText(this,"Aucun groupe actif",Toast.LENGTH_SHORT).show();
+                return;
+            }
+            db.collection("groups").document(currentGroupId)
+                    .get()
+                    .addOnSuccessListener(doc -> {
+                        if (doc.exists()) {
+                            List<String> members = (List<String>) doc.get("members");
+                            showGroupDialog(members);
+                        }
+                    });
+        });
+
+        // Rejoindre groupe
+        btnJoinGroup.setOnClickListener(v -> {
+            final EditText input = new EditText(this);
+            new AlertDialog.Builder(this)
+                    .setTitle("Entrer l'ID du groupe")
+                    .setView(input)
+                    .setPositiveButton("Rejoindre", (d,w) -> {
+                        String gid = input.getText().toString().trim();
+                        if (!gid.isEmpty()) joinGroupById(gid);
+                    })
+                    .setNegativeButton("Annuler", null)
+                    .show();
+        });
+    }
+
+    private void showGroupDialog(List<String> members) {
+        StringBuilder sb = new StringBuilder("Membres du groupe :\n\n");
+        for (String m : members) sb.append(m).append("\n");
+        sb.append("\nQuitter le groupe ?");
+        new AlertDialog.Builder(this)
+                .setTitle("Groupe")
+                .setMessage(sb.toString())
+                .setPositiveButton("Quitter", (d,w) -> {
+                    if (user != null && user.getEmail() != null) {
+                        db.collection("groups")
+                                .document(currentGroupId)
+                                .update("members",
+                                        com.google.firebase.firestore.FieldValue.arrayRemove(user.getEmail()))
+                                .addOnSuccessListener(a -> {
+                                    prefs.edit().remove(GROUP_ID_KEY).apply();
+                                    currentGroupId = null;
+                                    updateGroupIdText();
+                                    updateCreateGroupButtonText();
+                                    calendarView.removeDecorators();
+                                    Toast.makeText(this,"Groupe quitté",Toast.LENGTH_SHORT).show();
+                                });
+                    }
+                })
+                .setNegativeButton("Fermer", null)
+                .show();
+    }
+
+    // ----------------------------
+    //  Ajouter un événement
+    // ----------------------------
+    private void showAddEventDialog(CalendarDay date) {
+        View dialogView = LayoutInflater.from(this)
+                .inflate(R.layout.dialog_add_event, null);
+        AlertDialog.Builder builder = new AlertDialog.Builder(this)
+                .setTitle("Ajouter un événement")
+                .setView(dialogView);
+
+        EditText edtName    = dialogView.findViewById(R.id.editEventName);
+        EditText edtComment = dialogView.findViewById(R.id.editEventComment);
+        EditText edtStart   = dialogView.findViewById(R.id.editEventStartHour);
+        EditText edtDur     = dialogView.findViewById(R.id.editEventDuration);
+
+        builder.setPositiveButton("Ajouter", (dlg, which) -> {
+            String name    = edtName   .getText().toString().trim();
+            String comment = edtComment.getText().toString().trim();
+            String start   = edtStart  .getText().toString().trim();
+            String dur     = edtDur    .getText().toString().trim();
+
+            if (currentGroupId != null && !name.isEmpty()) {
+                Map<String,Object> event = new HashMap<>();
+                event.put("name",      name);
+                event.put("comment",   comment);
+                event.put("startHour", start);
+                event.put("duration",  dur);
+                // --- on retire le +1 ici ---
+                String iso = String.format(
+                        Locale.getDefault(),
+                        "%04d-%02d-%02d",
+                        date.getYear(),
+                        date.getMonth(),
+                        date.getDay()
+                );
+                Log.d("EVENT_ADD", "Date ISO = " + iso);
+                event.put("date", iso);
+                event.put("groupId", currentGroupId);
+
+                db.collection("groups")
+                        .document(currentGroupId)
+                        .collection("events")
+                        .add(event)
+                        .addOnSuccessListener(ref -> {
+                            Toast.makeText(this,"Événement ajouté !",Toast.LENGTH_SHORT).show();
+                            updateCalendarDots();
+                        });
+            } else {
+                Toast.makeText(this,"Nom requis ou groupe manquant",
+                        Toast.LENGTH_SHORT).show();
+            }
+        });
+
+        builder.setNegativeButton("Annuler", null)
+                .show();
+    }
+
+    // ----------------------------
+    //  Afficher / supprimer un événement
+    // ----------------------------
+    private void showEventsForDay(CalendarDay date) {
+        if (currentGroupId == null) {
+            Toast.makeText(this,"Aucun groupe actif",Toast.LENGTH_SHORT).show();
+            return;
+        }
+
+        // --- on retire le +1 ici aussi ---
+        String dateStr = String.format(
+                Locale.getDefault(),
+                "%04d-%02d-%02d",
+                date.getYear(),
+                date.getMonth(),
+                date.getDay()
+        );
+        Log.d("EVENT_QUERY", "Recherche pour date = " + dateStr);
+
+        db.collection("groups")
+                .document(currentGroupId)
+                .collection("events")
+                .whereEqualTo("date", dateStr)
+                .get()
+                .addOnSuccessListener(query -> {
+                    if (query.isEmpty()) {
+                        showAddEventDialog(date);
+                    } else {
+                        List<String> titles  = new ArrayList<>();
+                        List<String> ids     = new ArrayList<>();
+                        List<String> details = new ArrayList<>();
+                        for (QueryDocumentSnapshot doc : query) {
+                            String n = doc.getString("name");
+                            String c = doc.getString("comment");
+                            String s = doc.getString("startHour");
+                            String d = doc.getString("duration");
+                            titles.add(n);
+                            ids   .add(doc.getId());
+                            details.add(
+                                    "Nom : " + n +
+                                            "\nCommentaire : " + (c == null ? "" : c) +
+                                            "\nHeure : " + (s == null ? "" : s) +
+                                            "\nDurée : " + (d == null ? "" : d)
+                            );
+                        }
+
+                        new AlertDialog.Builder(this)
+                                .setTitle("Événements du jour")
+                                .setItems(titles.toArray(new String[0]), (dlg, which) -> {
+                                    String evId = ids.get(which);
+                                    String det  = details.get(which);
+                                    new AlertDialog.Builder(this)
+                                            .setTitle("Détail")
+                                            .setMessage(det)
+                                            .setPositiveButton("Supprimer", (dd,ww) -> {
+                                                db.collection("groups")
+                                                        .document(currentGroupId)
+                                                        .collection("events")
+                                                        .document(evId)
+                                                        .delete()
+                                                        .addOnSuccessListener(v -> {
+                                                            Toast.makeText(this,"Supprimé",
+                                                                    Toast.LENGTH_SHORT).show();
+                                                            updateCalendarDots();
+                                                        });
+                                            })
+                                            .setNegativeButton("Fermer", null)
+                                            .show();
+                                })
+                                .setNeutralButton("Ajouter", (dlg, which) ->
+                                        showAddEventDialog(date)
+                                )
+                                .show();
+                    }
+                })
+                .addOnFailureListener(e -> {
+                    Toast.makeText(this,"Erreur lecture",Toast.LENGTH_SHORT).show();
+                });
+    }
+
+    // ----------------------------
+    //  Mettre des pastilles sur le calendrier
+    // ----------------------------
+    private void updateCalendarDots() {
+        if (currentGroupId == null) return;
+
+        db.collection("groups")
+                .document(currentGroupId)
+                .collection("events")
+                .get()
+                .addOnSuccessListener(query -> {
+                    Set<CalendarDay> daysWithEvents = new HashSet<>();
+
+                    SimpleDateFormat df = new SimpleDateFormat("yyyy-MM-dd",
+                            Locale.getDefault());
+                    df.setTimeZone(TimeZone.getTimeZone("Europe/Paris"));
+
+                    for (DocumentSnapshot doc : query) {
+                        Object raw = doc.get("date");
+                        Date eventDate = null;
+                        if (raw instanceof Timestamp) {
+                            eventDate = ((Timestamp)raw).toDate();
+                        } else if (raw instanceof String) {
+                            try {
+                                eventDate = df.parse((String)raw);
+                            } catch (ParseException ex) {
+                                ex.printStackTrace();
+                            }
+                        }
+                        if (eventDate != null) {
+                            Calendar cal = Calendar.getInstance();
+                            cal.setTime(eventDate);
+                            daysWithEvents.add(
+                                    CalendarDay.from(
+                                            cal.get(Calendar.YEAR),
+                                            cal.get(Calendar.MONTH) + 1,
+                                            cal.get(Calendar.DAY_OF_MONTH)
+                                    )
+                            );
+                        }
+                    }
+
+                    Log.d("CALENDAR_DEBUG",
+                            "Days w/ events=" + daysWithEvents);
+                    calendarView.removeDecorators();
+                    calendarView.addDecorator(
+                            new EventDotDecorator(
+                                    (HashSet<CalendarDay>) daysWithEvents
+                            )
+                    );
+                    calendarView.invalidateDecorators();
+                })
+                .addOnFailureListener(e -> {
+                    Toast.makeText(this,"Erreur récupération dots",
+                            Toast.LENGTH_SHORT).show();
+                });
+    }
+
+    // ----------------------------
+    //  Rejoindre un groupe existant
+    // ----------------------------
+    private void joinGroupById(String groupId) {
+        db.collection("groups")
+                .document(groupId)
+                .get()
+                .addOnSuccessListener(doc -> {
+                    if (doc.exists()) {
+                        List<String> members = (List<String>) doc.get("members");
+                        String email = user.getEmail();
+                        if (members != null && !members.contains(email)) {
+                            members.add(email);
+                            db.collection("groups")
+                                    .document(groupId)
+                                    .update("members", members);
+                        }
+                        prefs.edit().putString(GROUP_ID_KEY, groupId).apply();
+                        currentGroupId = groupId;
+                        updateGroupIdText();
+                        updateCreateGroupButtonText();
+                        updateCalendarDots();
+                        Toast.makeText(this,"Groupe rejoint !",
+                                Toast.LENGTH_SHORT).show();
+                    } else {
+                        Toast.makeText(this,"Groupe introuvable",
+                                Toast.LENGTH_SHORT).show();
+                    }
+                })
+                .addOnFailureListener(e -> {
+                    Toast.makeText(this,"Erreur: "+e.getMessage(),
+                            Toast.LENGTH_SHORT).show();
+                });
+    }
+
+    // ----------------------------
+    //  Dialog login/register
+    // ----------------------------
+    private void showLoginDialog() {
+        View view = LayoutInflater.from(this)
+                .inflate(R.layout.activity_login, null);
+        EditText emailInp    = view.findViewById(R.id.emailInput);
+        EditText passwordInp = view.findViewById(R.id.passwordInput);
+        Button  btnLogin     = view.findViewById(R.id.loginBtn);
+        Button  btnReg       = view.findViewById(R.id.registerBtn);
+
+        AlertDialog dialog = new AlertDialog.Builder(this)
+                .setView(view)
+                .create();
+
+        btnLogin.setOnClickListener(v -> {
+            String email = emailInp.getText().toString().trim();
+            String pass  = passwordInp.getText().toString().trim();
+            if (email.isEmpty() || pass.isEmpty()) {
+                Toast.makeText(this,"Remplis tous les champs",
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
+            auth.signInWithEmailAndPassword(email, pass)
+                    .addOnSuccessListener(a -> {
+                        user = auth.getCurrentUser();
+                        updateAuthButtonText();
+                        Toast.makeText(this,"Connecté !",
+                                Toast.LENGTH_SHORT).show();
+                        dialog.dismiss();
+                    })
+                    .addOnFailureListener(e ->
+                            Toast.makeText(this,"Erreur: "+e.getMessage(),
+                                    Toast.LENGTH_SHORT).show()
+                    );
+        });
+
+        btnReg.setOnClickListener(v -> {
+            String email = emailInp.getText().toString().trim();
+            String pass  = passwordInp.getText().toString().trim();
+            if (email.isEmpty() || pass.isEmpty()) {
+                Toast.makeText(this,"Remplis tous les champs",
+                        Toast.LENGTH_SHORT).show();
+                return;
+            }
+            auth.createUserWithEmailAndPassword(email, pass)
+                    .addOnSuccessListener(a -> {
+                        user = auth.getCurrentUser();
+                        updateAuthButtonText();
+                        Toast.makeText(this,"Compte créé !",
+                                Toast.LENGTH_SHORT).show();
+                        dialog.dismiss();
+                    })
+                    .addOnFailureListener(e ->
+                            Toast.makeText(this,"Erreur: "+e.getMessage(),
+                                    Toast.LENGTH_SHORT).show()
+                    );
+        });
+
+        dialog.show();
+    }
+}
