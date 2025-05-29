@@ -1,0 +1,372 @@
+import SwiftUI
+import FirebaseAuth
+import FirebaseFirestore
+
+struct CalendarView: View {
+    @ObservedObject var eventManager: EventManager
+
+    @AppStorage("groupId") private var groupId: String = ""
+    @AppStorage("userEmail") private var userEmail: String = ""
+    @State private var currentDate = Date()
+    @State private var showAddEvent = false
+    @State private var selectedDate: Date? = nil
+    @State private var showDetail = false
+    @State private var popUpDate: Date? = nil
+    @State private var showEventList: Bool = false
+    @State private var joinGroupId: String = ""
+    @State private var showJoinGroupSheet = false
+    @State private var user: User? = nil
+    @State private var showLoginSheet = false
+    @State private var email = ""
+    @State private var password = ""
+    @State private var loginError = ""
+    @State private var showGroupSheet = false
+    @State private var groupMembers: [String] = []
+    @State private var selectedEvent: Event? = nil
+
+    // Confirmation dialogs
+    @State private var showLogoutConfirmation = false
+    @State private var showQuitGroupConfirmation = false
+
+    var body: some View {
+        VStack {
+            // Auth & Group Controls
+            VStack(spacing: 8) {
+                // Connexion / Déconnexion
+                Button(action: handleAuthAction) {
+                    Text(user == nil ? "CONNEXION" : "DÉCONNEXION")
+                        .frame(maxWidth: .infinity)
+                }
+                .alert("Déconnexion", isPresented: $showLogoutConfirmation) {
+                    Button("Annuler", role: .cancel) {}
+                    Button("Oui", role: .destructive) {
+                        performLogout()
+                    }
+                } message: {
+                    Text("Êtes-vous sûr de vouloir vous déconnecter ?")
+                }
+                .onAppear(perform: setupAuth)
+
+                // Créer ou Quitter un groupe
+                Button(action: handleGroupButton) {
+                    Text(groupId.isEmpty ? "CRÉER UN GROUPE" : "QUITTER LE GROUPE")
+                        .frame(maxWidth: .infinity)
+                }
+                .disabled(user == nil)
+                .buttonStyle(GroupButtonStyle())
+                .alert(groupId.isEmpty ? "Créer un groupe" : "Quitter le groupe",
+                       isPresented: $showQuitGroupConfirmation) {
+                    Button("Annuler", role: .cancel) {}
+                    Button(groupId.isEmpty ? "Créer" : "Quitter", role: groupId.isEmpty ? .none : .destructive) {
+                        if groupId.isEmpty {
+                            performCreateGroup()
+                        } else {
+                            leaveGroup()
+                        }
+                    }
+                } message: {
+                    Text(groupId.isEmpty
+                         ? "Voulez-vous vraiment créer un nouveau groupe ?"
+                         : "Voulez-vous vraiment quitter le groupe ?")
+                }
+
+                // Voir mon groupe
+                Button("VOIR MON GROUPE") {
+                    fetchGroupMembers()
+                    showGroupSheet = true
+                }
+                .disabled(user == nil || groupId.isEmpty)
+                .buttonStyle(GroupButtonStyle())
+
+                // Rejoindre un groupe par ID
+                Button("REJOINDRE UN GROUPE PAR ID") {
+                    showJoinGroupSheet = true
+                }
+                .disabled(user == nil)
+                .buttonStyle(GroupButtonStyle())
+
+                // Affichage de l'ID
+                if !groupId.isEmpty {
+                    Text("Groupe ID : \(groupId)")
+                        .font(.subheadline)
+                        .foregroundColor(.gray)
+                        .padding(.top, 4)
+                }
+            }
+            .padding()
+
+            // Calendar UI
+            monthNavigation
+            weekDaysHeader
+            daysGrid()
+            Spacer()
+        }
+        // Sheets
+        .sheet(isPresented: $showLoginSheet) { loginSheet() }
+        .sheet(isPresented: $showGroupSheet) { groupSheet() }
+        .sheet(isPresented: $showJoinGroupSheet) { joinGroupSheet() }
+        .sheet(isPresented: $showEventList) { eventListSheet() }
+        .sheet(isPresented: $showAddEvent) { addEventSheet() }
+        .sheet(isPresented: $showDetail) { detailSheet() }
+    }
+
+    // MARK: - Auth Logic
+    private func setupAuth() {
+        Auth.auth().addStateDidChangeListener { _, authUser in
+            self.user = authUser
+        }
+        if !groupId.isEmpty {
+            eventManager.groupId = groupId
+        }
+    }
+
+    private func handleAuthAction() {
+        if user == nil {
+            showLoginSheet = true
+        } else {
+            showLogoutConfirmation = true
+        }
+    }
+
+    private func performLogout() {
+        try? Auth.auth().signOut()
+        user = nil
+        groupId = ""
+        eventManager.groupId = ""
+    }
+
+    // MARK: - Group Logic
+    private func handleGroupButton() {
+        showQuitGroupConfirmation = true
+    }
+
+    private func performCreateGroup() {
+        guard let u = user else { return }
+        let newId = UUID().uuidString
+        Firestore.firestore().collection("groups").document(newId)
+            .setData(["members": [u.uid], "createdAt": FieldValue.serverTimestamp()]) { err in
+                if err == nil {
+                    groupId = newId
+                    eventManager.groupId = newId
+                }
+            }
+    }
+
+    private func fetchGroupMembers() {
+        Firestore.firestore().collection("groups").document(groupId)
+            .getDocument { snapshot, _ in
+                if let data = snapshot?.data(), let members = data["members"] as? [String] {
+                    groupMembers = members
+                } else {
+                    groupMembers = []
+                }
+            }
+    }
+
+    private func leaveGroup() {
+        guard let u = user else { return }
+        Firestore.firestore().collection("groups").document(groupId)
+            .updateData(["members": FieldValue.arrayRemove([u.uid])]) { _ in
+                groupId = ""
+                eventManager.groupId = ""
+            }
+    }
+
+    // MARK: - Sheets Builders
+    private func loginSheet() -> some View {
+        VStack(spacing: 16) {
+            Text("Connexion ou inscription").font(.headline)
+            TextField("E-mail", text: $email)
+                .textFieldStyle(RoundedBorderTextFieldStyle())
+                .autocapitalization(.none)
+                .keyboardType(.emailAddress)
+            SecureField("Mot de passe", text: $password)
+                .textFieldStyle(RoundedBorderTextFieldStyle())
+            if !loginError.isEmpty {
+                Text(loginError).foregroundColor(.red)
+            }
+            HStack {
+                Button("Se connecter") { signIn() }
+                Button("Créer un compte") { signUp() }
+            }
+            Button("Annuler") { showLoginSheet = false }
+                .foregroundColor(.gray)
+        }
+        .padding()
+    }
+
+    private func signIn() {
+        Auth.auth().signIn(withEmail: email, password: password) { res, err in
+            if let u = res?.user {
+                user = u; showLoginSheet = false; loginError = ""
+            } else {
+                loginError = err?.localizedDescription ?? "Erreur inconnue"
+            }
+        }
+    }
+
+    private func signUp() {
+        Auth.auth().createUser(withEmail: email, password: password) { res, err in
+            if let u = res?.user {
+                user = u; showLoginSheet = false; loginError = ""
+            } else {
+                loginError = err?.localizedDescription ?? "Erreur inconnue"
+            }
+        }
+    }
+
+    private func groupSheet() -> some View {
+        VStack {
+            Text("Membres du groupe")
+            ForEach(groupMembers, id: \.self) { Text($0) }
+            Button("Fermer") { showGroupSheet = false }
+        }
+        .padding()
+    }
+
+    private func joinGroupSheet() -> some View {
+        VStack(spacing: 16) {
+            Text("Entrer l'ID du groupe :")
+            TextField("ID du groupe", text: $joinGroupId)
+                .textFieldStyle(RoundedBorderTextFieldStyle())
+                .padding()
+            Button("Rejoindre") { joinGroup() }
+            Button("Annuler") { showJoinGroupSheet = false }
+        }
+        .padding()
+    }
+
+    private func joinGroup() {
+        guard let u = user else { return }
+        Firestore.firestore().collection("groups").document(joinGroupId)
+            .updateData(["members": FieldValue.arrayUnion([u.uid])]) { _ in
+                groupId = joinGroupId; eventManager.groupId = joinGroupId; showJoinGroupSheet = false
+            }
+    }
+
+    private func eventListSheet() -> some View {
+        if let date = popUpDate {
+            let key = readKey(for: date)
+            let evs = eventManager.eventsByDate[key] ?? []
+            return AnyView(EventListView(
+                date: date,
+                events: evs,
+                onAdd: { popUpDate = date; showAddEvent = true },
+                onDelete: { eventManager.deleteEvent($0) },
+                onClose: { showEventList = false }
+            ))
+        }
+        return AnyView(EmptyView())
+    }
+
+    private func addEventSheet() -> some View {
+        if let date = popUpDate {
+            return AnyView(AddEventView(date: date, groupId: groupId) { event in
+                var e = event; e.date = writeKey(for: date)
+                eventManager.addEvent(e); showAddEvent = false
+            })
+        }
+        return AnyView(EmptyView())
+    }
+
+    private func detailSheet() -> some View {
+      guard let ev = selectedEvent else {
+        return AnyView(EmptyView())
+      }
+      return AnyView(
+        EventDetailView(event: ev, onDelete: {
+          eventManager.deleteEvent(ev)
+          showDetail = false
+        })
+      )
+    }
+
+    // MARK: - Calendar Helpers
+    private func readKey(for date: Date) -> String {
+        var comps = Calendar.current.dateComponents([.year, .month, .day], from: date)
+        comps.month = (comps.month ?? 0) + 2
+        return String(format: "%04d-%02d-%02d", comps.year ?? 0, comps.month ?? 0, comps.day ?? 0)
+    }
+
+    private func writeKey(for date: Date) -> String {
+        var comps = Calendar.current.dateComponents([.year, .month, .day], from: date)
+        comps.month = (comps.month ?? 0) - 1
+        return String(format: "%04d-%02d-%02d", comps.year ?? 0, comps.month ?? 0, comps.day ?? 0)
+    }
+
+    // MARK: - Calendar Subviews
+    private var monthNavigation: some View {
+        HStack {
+            Button(action: { moveMonth(by: -1) }) { Image(systemName: "chevron.left") }
+            Spacer()
+            Text(monthYearString(from: currentDate))
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+            Spacer()
+            Button(action: { moveMonth(by: 1) }) { Image(systemName: "chevron.right") }
+        }
+        .padding(.horizontal)
+    }
+
+    private var weekDaysHeader: some View {
+        let days = ["Lun","Mar","Mer","Jeu","Ven","Sam","Dim"]
+        return HStack { ForEach(days, id: \.self) { Text($0).font(.subheadline).frame(maxWidth: .infinity) } }
+    }
+
+    private func daysGrid() -> some View {
+        let daysInMonth = CalendarHelper.shared.daysInMonth(for: currentDate)
+        let firstWeekday = (CalendarHelper.shared.firstWeekdayOfMonth(for: currentDate) + 5) % 7
+        let rows = ((daysInMonth + firstWeekday - 1) / 7) + 1
+        return VStack(spacing: 8) {
+            ForEach(0..<rows, id: \.self) { row in
+                HStack(spacing: 0) {
+                    ForEach(0..<7, id: \.self) { col in
+                        dayCellView(row: row, col: col, daysInMonth: daysInMonth, firstWeekday: firstWeekday)
+                    }
+                }
+            }
+        }.padding(.horizontal, 4)
+    }
+
+    private func dayCellView(row: Int, col: Int, daysInMonth: Int, firstWeekday: Int) -> some View {
+        let rawDay = row*7 + col - (firstWeekday-1)
+        guard rawDay >= 1 && rawDay <= daysInMonth else {
+            return AnyView(Text("").frame(maxWidth: .infinity,maxHeight:30))
+        }
+        let date = CalendarHelper.shared.dayDate(rawDay, in: currentDate)
+        let key = readKey(for: date)
+        let hasDot = !(eventManager.eventsByDate[key]?.isEmpty ?? true)
+        return AnyView(
+            Button(action: { popUpDate = date; showEventList = true }) {
+                ZStack {
+                    Text("\(rawDay)").frame(maxWidth: .infinity,maxHeight:30)
+                    if hasDot { Circle().frame(width:7,height:7).offset(y:14) }
+                }
+            }.buttonStyle(PlainButtonStyle())
+        )
+    }
+
+    // MARK: - Utilities
+    private func monthYearString(from date: Date) -> String {
+        let fmt = DateFormatter()
+        fmt.dateFormat = "LLLL yyyy"
+        fmt.locale = Locale(identifier: "fr_FR")
+        return fmt.string(from: date).capitalized
+    }
+
+    private func moveMonth(by value: Int) {
+        if let d = Calendar.current.date(byAdding: .month, value: value, to: currentDate) {
+            currentDate = d
+        }
+    }
+}
+
+struct GroupButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .frame(maxWidth: .infinity)
+            .padding()
+            .background(Color.gray.opacity(0.2))
+            .cornerRadius(8)
+    }
+}
